@@ -1,0 +1,25 @@
+[project]
+name = "weaviate-migration"
+version = "0.1.0"
+description = "Default template for PDM package"
+authors = [
+    {name = "Enoch Zhao", email = "enoch.zhao@clare.ai"},
+]
+dependencies = [
+    "requests>=2.32.0",
+    "matplotlib>=3.7.0",
+    "pandas>=2.0.0",
+    "seaborn>=0.12.0",
+    "weaviate-client>=3.26.0,<4.0.0",
+    "pymilvus>=2.3.0",
+    "python-dotenv>=1.0.0",
+    "tqdm>=4.66.0",
+    "numpy>=1.24.0",
+]
+requires-python = "==3.12.*"
+readme = "README.md"
+license = {text = "MIT"}
+
+
+[tool.pdm]
+distribution = false
