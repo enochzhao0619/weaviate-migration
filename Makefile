@@ -1,6 +1,6 @@
 # Weaviate to Zilliz Migration Tool Makefile
 
-.PHONY: help setup install test clean migrate dry-run
+.PHONY: help setup install test clean migrate dry-run load-collections
 
 # Default target
 help:
@@ -14,6 +14,7 @@ help:
 	@echo "  test      - Test connections to Weaviate and Zilliz"
 	@echo "  dry-run   - Preview migration without execution"
 	@echo "  migrate   - Run full migration"
+	@echo "  load-collections - Load all collections in Zilliz Cloud"
 	@echo "  clean     - Clean up logs and cache files"
 	@echo "  clean-all - Deep clean (logs, reports, cache)"
 	@echo ""
@@ -50,6 +51,11 @@ dry-run:
 migrate:
 	@echo "Running migration..."
 	python migrate.py $(if $(COLLECTIONS),-c $(COLLECTIONS)) $(if $(BATCH_SIZE),--batch-size $(BATCH_SIZE)) $(if $(LOG_LEVEL),--log-level $(LOG_LEVEL))
+
+# Load all collections
+load-collections:
+	@echo "Loading all collections in Zilliz Cloud..."
+	cd migration-v1 && python load_collections.py
 
 # Clean up
 clean:

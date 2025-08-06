@@ -15,16 +15,16 @@ class MigrationConfig:
     
     def __init__(self):
         # Weaviate configuration
-        self.weaviate_endpoint = os.getenv('WEAVIATE_ENDPOINT', 'http://localhost:8080')
-        self.weaviate_api_key = os.getenv('WEAVIATE_API_KEY', '')
+        self.weaviate_endpoint = os.getenv('WEAVIATE_ENDPOINT', 'http://10.148.0.19')
+        self.weaviate_api_key = os.getenv('WEAVIATE_API_KEY', 'WVF5YThaHlkYwhGUSmCRgsX3tD5ngdN8pkih')
         
         # Zilliz Cloud configuration
-        self.zilliz_uri = os.getenv('ZILLIZ_CLOUD_URI', '')
-        self.zilliz_token = os.getenv('ZILLIZ_CLOUD_API_KEY', '')
+        self.zilliz_uri = os.getenv('ZILLIZ_CLOUD_URI', 'https://in01-a2db19e83930938.aws-us-west-2.vectordb.zillizcloud.com:19542')
+        self.zilliz_token = os.getenv('ZILLIZ_CLOUD_API_KEY', '1f7f189111d65b5a28fa06dff3271af8453e682f3ac72449d9b5aec521d090645acc773cd8269521a38dabc5ae11fbe5e8fa48a1')
         self.zilliz_db_name = os.getenv('ZILLIZ_CLOUD_DATABASE', 'default')
         
         # Migration configuration
-        self.batch_size = int(os.getenv('MIGRATION_BATCH_SIZE', '100'))
+        self.batch_size = int(os.getenv('MIGRATION_BATCH_SIZE', '300'))
         self.max_retries = int(os.getenv('MIGRATION_MAX_RETRIES', '3'))
         self.retry_delay = float(os.getenv('MIGRATION_RETRY_DELAY', '1.0'))
         

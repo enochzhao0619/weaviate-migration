@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 import time
 from tqdm import tqdm
 import numpy as np
+import requests
 from data_transformer import DataTransformer
 from utils import retry_on_failure, log_memory_usage, create_safe_collection_name
 
@@ -42,16 +43,18 @@ class WeaviateToZillizMigrator:
     
     def __init__(self):
         # Weaviate configuration
-        self.weaviate_url = os.getenv('WEAVIATE_ENDPOINT', 'http://localhost:8080')
-        self.weaviate_api_key = os.getenv('WEAVIATE_API_KEY', '')
+        self.weaviate_endpoint = os.getenv('WEAVIATE_ENDPOINT', 'http://10.148.0.19')
+        self.weaviate_api_key = os.getenv('WEAVIATE_API_KEY', 'WVF5YThaHlkYwhGUSmCRgsX3tD5ngdN8pkih')
         
         # Zilliz Cloud configuration
-        self.zilliz_uri = os.getenv('ZILLIZ_CLOUD_URI', '')
-        self.zilliz_token = os.getenv('ZILLIZ_CLOUD_API_KEY', '')
+        self.zilliz_uri = os.getenv('ZILLIZ_CLOUD_URI', 'https://in01-a2db19e83930938.aws-us-west-2.vectordb.zillizcloud.com:19542')
+        self.zilliz_token = os.getenv('ZILLIZ_CLOUD_API_KEY', '1f7f189111d65b5a28fa06dff3271af8453e682f3ac72449d9b5aec521d090645acc773cd8269521a38dabc5ae11fbe5e8fa48a1')
         self.zilliz_db_name = os.getenv('ZILLIZ_CLOUD_DATABASE', 'default')
         
         # Migration configuration
-        self.batch_size = int(os.getenv('MIGRATION_BATCH_SIZE', '100'))
+        self.batch_size = int(os.getenv('MIGRATION_BATCH_SIZE', '300'))
+        self.max_retries = int(os.getenv('MIGRATION_MAX_RETRIES', '3'))
+        self.retry_delay = float(os.getenv('MIGRATION_RETRY_DELAY', '1.0'))
         self.dimension = None
         
         # Client instances
@@ -68,6 +71,7 @@ class WeaviateToZillizMigrator:
             'total_collections': 0,
             'successful_collections': [],
             'failed_collections': [],
+            'skipped_collections': [],
             'total_documents': 0,
             'migrated_documents': 0
         }
@@ -79,19 +83,19 @@ class WeaviateToZillizMigrator:
             if self.weaviate_api_key:
                 auth_config = weaviate.AuthApiKey(api_key=self.weaviate_api_key)
                 self.weaviate_client = weaviate.Client(
-                    url=self.weaviate_url,
+                    url=self.weaviate_endpoint,
                     auth_client_secret=auth_config,
                     timeout_config=(60, 60)  # (connect_timeout, read_timeout)
                 )
             else:
                 self.weaviate_client = weaviate.Client(
-                    url=self.weaviate_url,
+                    url=self.weaviate_endpoint,
                     timeout_config=(60, 60)
                 )
             
             # Test connection
             if self.weaviate_client.is_ready():
-                logger.info(f"Successfully connected to Weaviate at {self.weaviate_url}")
+                logger.info(f"Successfully connected to Weaviate at {self.weaviate_endpoint}")
                 # Get Weaviate version info
                 meta = self.weaviate_client.get_meta()
                 logger.info(f"Weaviate version: {meta.get('version', 'unknown')}")
@@ -180,7 +184,7 @@ class WeaviateToZillizMigrator:
             logger.error(f"Failed to get data from collection {collection_name}: {str(e)}")
             raise
             
-    def create_zilliz_collection(self, collection_name: str, dimension: int, schema_info: Dict[str, Any] = None):
+    def create_zilliz_collection(self, collection_name: str, dimension: int, schema_info: Dict[str, Any] = None) -> bool:
         """Create a collection in Zilliz Cloud with the same schema"""
         try:
             # Ensure collection name is safe
@@ -191,10 +195,8 @@ class WeaviateToZillizMigrator:
             
             # Check if collection already exists
             if self.zilliz_client.has_collection(collection_name):
-                logger.warning(f"Collection {collection_name} already exists in Zilliz Cloud")
-                # For automated migration, drop and recreate
-                self.zilliz_client.drop_collection(collection_name)
-                logger.info(f"Dropped existing collection {collection_name}")
+                logger.info(f"Collection {collection_name} already exists in Zilliz Cloud, skipping creation")
+                return False  # Collection already exists, skipped
                 
             # Use transformer to create schema fields
             fields = self.transformer.create_zilliz_schema_fields(schema_info or {}, dimension)
@@ -222,10 +224,125 @@ class WeaviateToZillizMigrator:
                 index_params=index_params
             )
             
-            logger.info(f"Successfully created collection {collection_name} in Zilliz Cloud")
+            # Load collection after creation
+            self.load_collection(collection_name)
+            
+            logger.info(f"Successfully created and loaded collection {collection_name} in Zilliz Cloud")
+            return True  # Collection created successfully
             
         except Exception as e:
             logger.error(f"Failed to create collection {collection_name}: {str(e)}")
+            raise
+    
+    def load_collection(self, collection_name: str):
+        """Load collection in Zilliz Cloud using REST API"""
+        try:
+            # Extract endpoint from URI
+            endpoint = self.zilliz_uri
+
+            url = f"{endpoint}/v2/vectordb/collections/load"
+            
+            headers = {
+                "Authorization": f"Bearer {self.zilliz_token}",
+                "Content-Type": "application/json"
+            }
+            
+            data = {
+                "collectionName": collection_name
+            }
+            
+            response = requests.post(url, headers=headers, json=data, timeout=30)
+            
+            if response.status_code == 200:
+                logger.info(f"Successfully loaded collection {collection_name}")
+            else:
+                logger.warning(f"Failed to load collection {collection_name}: {response.status_code} - {response.text}")
+                
+        except Exception as e:
+            logger.warning(f"Failed to load collection {collection_name}: {str(e)}")
+            # Don't raise exception as this is not critical for migration
+
+    def get_zilliz_collections(self) -> List[str]:
+        """Get all collection names from Zilliz Cloud using REST API"""
+        try:
+            # Extract endpoint from URI
+            endpoint = self.zilliz_uri
+            
+            url = f"{endpoint}/v2/vectordb/collections/list"
+            
+            headers = {
+                "Authorization": f"Bearer {self.zilliz_token}",
+                "Content-Type": "application/json"
+            }
+            
+            data = {
+                "dbName": "default" if self.zilliz_db_name == "default" else self.zilliz_db_name
+            }
+            
+            response = requests.post(url, headers=headers, json=data, timeout=30)
+            
+            if response.status_code == 200:
+                result = response.json()
+                collections = []
+                if result.get('code') == 0 and 'data' in result:
+                    collections = result['data']
+                    logger.info(f"Found {len(collections)} collections in Zilliz Cloud: {collections}")
+                else:
+                    logger.warning(f"Unexpected response format: {result}")
+                return collections
+            else:
+                logger.error(f"Failed to list collections: {response.status_code} - {response.text}")
+                return []
+                
+        except Exception as e:
+            logger.error(f"Failed to get Zilliz collections: {str(e)}")
+            return []
+
+    def load_all_collections(self):
+        """Load all collections in Zilliz Cloud"""
+        logger.info("Loading all collections in Zilliz Cloud")
+        
+        try:
+            # Get all collections
+            collections = self.get_zilliz_collections()
+            
+            if not collections:
+                logger.warning("No collections found in Zilliz Cloud")
+                return
+            
+            logger.info(f"Found {len(collections)} collections to load")
+            
+            # Load each collection
+            successful_loads = []
+            failed_loads = []
+            
+            for collection in collections:
+                try:
+                    logger.info(f"Loading collection: {collection}")
+                    self.load_collection(collection)
+                    successful_loads.append(collection)
+                except Exception as e:
+                    logger.error(f"Failed to load collection {collection}: {str(e)}")
+                    failed_loads.append(collection)
+            
+            # Print summary
+            logger.info(f"\nLoad Summary:")
+            logger.info(f"Total collections: {len(collections)}")
+            logger.info(f"Successfully loaded: {len(successful_loads)}")
+            logger.info(f"Failed to load: {len(failed_loads)}")
+            
+            if successful_loads:
+                logger.info(f"Successfully loaded collections:")
+                for collection in successful_loads:
+                    logger.info(f"  ✓ {collection}")
+            
+            if failed_loads:
+                logger.warning(f"Failed to load collections:")
+                for collection in failed_loads:
+                    logger.warning(f"  ✗ {collection}")
+                    
+        except Exception as e:
+            logger.error(f"Failed to load all collections: {str(e)}")
             raise
             
     @retry_on_failure(max_retries=3, delay=1.0)
@@ -267,19 +384,23 @@ class WeaviateToZillizMigrator:
             
             if not weaviate_data:
                 logger.warning(f"No data found in collection {collection_name}")
-                return 0
+                return 0, False  # Return migrated count and skip status
                 
             # Extract dimension from first vector
             first_vector = weaviate_data[0]['_additional'].get('vector')
             if not first_vector:
                 logger.error(f"No vector found in collection {collection_name}")
-                return 0
+                return 0, False
                 
             dimension = len(first_vector)
             logger.info(f"Vector dimension: {dimension}")
             
-            # Create collection in Zilliz
-            self.create_zilliz_collection(collection_name, dimension, schema_info)
+            # Create collection in Zilliz (returns True if created, False if skipped)
+            collection_created = self.create_zilliz_collection(collection_name, dimension, schema_info)
+            
+            if not collection_created:
+                logger.info(f"Collection {collection_name} already exists, skipping data migration")
+                return 0, True  # Return 0 migrated docs and True for skipped
             
             # Log memory usage before migration
             log_memory_usage()
@@ -318,7 +439,7 @@ class WeaviateToZillizMigrator:
                         continue
                         
             logger.info(f"Successfully migrated {migrated_count}/{total_docs} documents in {collection_name}")
-            return migrated_count
+            return migrated_count, False  # Return migrated count and not skipped
             
         except Exception as e:
             logger.error(f"Failed to migrate collection {collection_name}: {str(e)}")
@@ -331,17 +452,19 @@ class WeaviateToZillizMigrator:
             weaviate_data = self.get_collection_data(collection_name)
             weaviate_count = len(weaviate_data)
             
-            # Get Zilliz count
-            result = self.zilliz_client.query(
-                collection_name=collection_name,
-                filter="",
-                output_fields=["count(*)"],
-                limit=1
-            )
-            
-            zilliz_count = 0
-            if result and len(result) > 0:
-                zilliz_count = result[0].get('count(*)', 0)
+            # Get Zilliz count using get_collection_stats
+            try:
+                stats = self.zilliz_client.get_collection_stats(collection_name)
+                zilliz_count = stats.get('row_count', 0)
+            except:
+                # Fallback: query all documents and count them
+                result = self.zilliz_client.query(
+                    collection_name=collection_name,
+                    filter="",
+                    output_fields=["id"],
+                    limit=16384  # Max limit for Milvus
+                )
+                zilliz_count = len(result) if result else 0
             
             logger.info(f"Verification for {collection_name}:")
             logger.info(f"  Weaviate documents: {weaviate_count}")
@@ -365,7 +488,7 @@ class WeaviateToZillizMigrator:
                 'migration_summary': self.migration_stats,
                 'timestamp': datetime.now().isoformat(),
                 'configuration': {
-                    'weaviate_endpoint': self.weaviate_url,
+                    'weaviate_endpoint': self.weaviate_endpoint,
                     'zilliz_uri': self.zilliz_uri,
                     'batch_size': self.batch_size
                 }
@@ -408,13 +531,18 @@ class WeaviateToZillizMigrator:
                     logger.info(f"Processing collection: {collection}")
                     logger.info(f"{'='*60}")
                     
-                    migrated_docs = self.migrate_collection(collection, limit=limit)
-                    self.migration_stats['migrated_documents'] += migrated_docs
+                    migrated_docs, was_skipped = self.migrate_collection(collection, limit=limit)
                     
-                    if self.verify_migration(collection):
-                        self.migration_stats['successful_collections'].append(collection)
+                    if was_skipped:
+                        self.migration_stats['skipped_collections'].append(collection)
+                        logger.info(f"Collection {collection} was skipped (already exists)")
                     else:
-                        self.migration_stats['failed_collections'].append(collection)
+                        self.migration_stats['migrated_documents'] += migrated_docs
+                        
+                        if self.verify_migration(collection):
+                            self.migration_stats['successful_collections'].append(collection)
+                        else:
+                            self.migration_stats['failed_collections'].append(collection)
                         
                 except Exception as e:
                     logger.error(f"Migration failed for {collection}: {str(e)}")
@@ -446,6 +574,7 @@ class WeaviateToZillizMigrator:
         logger.info(f"Total collections: {stats['total_collections']}")
         logger.info(f"Successful: {len(stats['successful_collections'])}")
         logger.info(f"Failed: {len(stats['failed_collections'])}")
+        logger.info(f"Skipped: {len(stats['skipped_collections'])}")
         logger.info(f"Total documents migrated: {stats['migrated_documents']}")
         
         if stats['successful_collections']:
@@ -457,6 +586,11 @@ class WeaviateToZillizMigrator:
             logger.warning(f"\nFailed collections:")
             for collection in stats['failed_collections']:
                 logger.warning(f"  ✗ {collection}")
+                
+        if stats['skipped_collections']:
+            logger.info(f"\nSkipped collections (already exist):")
+            for collection in stats['skipped_collections']:
+                logger.info(f"  ⏭ {collection}")
                 
         logger.info("\nMigration process completed")
 
@@ -478,6 +612,17 @@ def main():
         
     # Create migrator instance
     migrator = WeaviateToZillizMigrator()
+    
+    # Check if user wants to load all collections
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == 'load_collections':
+        try:
+            migrator.connect_zilliz()
+            migrator.load_all_collections()
+        except Exception as e:
+            logger.error(f"Failed to load collections: {str(e)}")
+            sys.exit(1)
+        return
     
     # Run migration
     try:

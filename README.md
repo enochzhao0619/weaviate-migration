@@ -117,6 +117,30 @@ python migrate_v2_gcs.py
 - **v2 GCS Migration**: See `docs/GCS_MIGRATION_README.md` and `docs/QUICKSTART_GCS.md`
 - **Weaviate Setup**: See `docs/WEAVIATE_V3_SETUP.md`
 
+## 🔄 Collection Management
+
+### Load Collections (v1)
+Load all collections in Zilliz Cloud to ensure they are ready for queries:
+
+```bash
+# Using Makefile
+make load-collections
+
+# Using direct script
+cd migration-v1
+python load_collections.py
+
+# Using main script with parameter
+cd migration-v1/src
+python weaviate_to_zilliz_migrator.py load_collections
+```
+
+This feature:
+- Lists all collections in Zilliz Cloud using REST API
+- Loads each collection individually
+- Provides detailed success/failure statistics
+- Logs all operations for debugging
+
 ## 🛠 Development
 
 ### Project Dependencies
@@ -129,6 +153,10 @@ pip install -r requirements.txt
 # Test v1 connections
 cd migration-v1
 python test_connections.py
+
+# Test load collections functionality
+cd migration-v1
+python test_load_collections.py
 
 # Test v2 configuration
 cd migration-v2-gcs
