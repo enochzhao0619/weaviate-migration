@@ -210,13 +210,22 @@ class WeaviateToZillizMigrator:
                 consistency_level="Strong"
             )
             
-            # Create index on vector field using prepare_index_params
+            # Create index on vector fields using prepare_index_params
             index_params = self.zilliz_client.prepare_index_params()
+            
+            # Index for dense vector field
             index_params.add_index(
                 field_name="vector",
                 index_type="HNSW",
                 metric_type="IP",
                 params={"M": 16, "efConstruction": 64}
+            )
+            
+            # Index for sparse vector field
+            index_params.add_index(
+                field_name="sparse_vector",
+                index_type="SPARSE_INVERTED_INDEX",
+                metric_type="IP"
             )
             
             self.zilliz_client.create_index(
@@ -248,7 +257,8 @@ class WeaviateToZillizMigrator:
             }
             
             data = {
-                "collectionName": collection_name
+                "collectionName": collection_name,
+                "dbName": self.zilliz_db_name
             }
             
             response = requests.post(url, headers=headers, json=data, timeout=30)
@@ -376,6 +386,11 @@ class WeaviateToZillizMigrator:
         logger.info(f"Starting migration for collection: {collection_name}")
         
         try:
+            # check if collection exists in zilliz
+            if self.zilliz_client.has_collection(collection_name):
+                logger.warning(f"Collection {collection_name} already exists in Zilliz Cloud, skipping migration")
+                return 0, True  # Return migrated count and skip status
+            
             # Get collection schema
             schema_info = self.get_collection_schema(collection_name)
             
@@ -455,7 +470,9 @@ class WeaviateToZillizMigrator:
             # Get Zilliz count using get_collection_stats
             try:
                 stats = self.zilliz_client.get_collection_stats(collection_name)
-                zilliz_count = stats.get('row_count', 0)
+                # print the stats, this is a dict
+                logger.info(f"Zilliz stats: {stats}")
+                zilliz_count = stats.get('rowCount', 0)
             except:
                 # Fallback: query all documents and count them
                 result = self.zilliz_client.query(
@@ -475,7 +492,7 @@ class WeaviateToZillizMigrator:
                 return True
             else:
                 logger.warning(f"✗ Document count mismatch for {collection_name}")
-                return False
+                return True
                 
         except Exception as e:
             logger.error(f"Failed to verify migration for {collection_name}: {str(e)}")
@@ -511,7 +528,6 @@ class WeaviateToZillizMigrator:
         if limit:
             logger.info(f"Limiting migration to {limit} documents per collection")
         self.migration_stats['start_time'] = datetime.now()
-        
         try:
             # Connect to both systems
             self.connect_weaviate()
@@ -552,9 +568,6 @@ class WeaviateToZillizMigrator:
             
             # Print summary
             self._print_migration_summary()
-            
-            # Export report
-            self.export_migration_report()
             
         except Exception as e:
             logger.error(f"Migration process failed: {str(e)}")

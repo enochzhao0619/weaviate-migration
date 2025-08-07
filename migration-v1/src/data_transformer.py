@@ -89,44 +89,23 @@ class DataTransformer:
             analysis['boolean_properties'].append(prop_name)
         
     def create_zilliz_schema_fields(self, weaviate_schema: Dict[str, Any], vector_dim: int) -> List[FieldSchema]:
-        """Create Zilliz schema fields based on Weaviate schema"""
+        """Create Zilliz schema fields compatible with Dify structure"""
         fields = []
         
-        # Basic required fields
+        # Create fields compatible with Dify's Zilliz structure
         fields.extend([
             FieldSchema(name="id", dtype=DataType.VARCHAR, is_primary=True, max_length=65535),
-            FieldSchema(name="text", dtype=DataType.VARCHAR, max_length=65535),
+            FieldSchema(name="page_content", dtype=DataType.VARCHAR, max_length=65535),
             FieldSchema(name="vector", dtype=DataType.FLOAT_VECTOR, dim=vector_dim),
-            FieldSchema(name="metadata", dtype=DataType.JSON)
+            FieldSchema(name="sparse_vector", dtype=DataType.SPARSE_FLOAT_VECTOR),
+            FieldSchema(name="metadata", dtype=DataType.JSON),
         ])
         
-        # Analyze Weaviate schema
-        schema_analysis = self.analyze_weaviate_schema(weaviate_schema)
-        
-        # Add fields based on Weaviate properties
-        for prop_name, prop_info in schema_analysis['properties'].items():
-            safe_name = prop_info['safe_name']
-            zilliz_type = prop_info['zilliz_type']
-            
-            # Skip if field name conflicts with basic fields
-            if safe_name in ['id', 'text', 'vector', 'metadata']:
-                continue
-                
-            try:
-                if zilliz_type == DataType.VARCHAR:
-                    fields.append(FieldSchema(name=safe_name, dtype=zilliz_type, max_length=65535))
-                else:
-                    fields.append(FieldSchema(name=safe_name, dtype=zilliz_type))
-                    
-                logger.debug(f"Added field: {safe_name} ({zilliz_type})")
-                
-            except Exception as e:
-                logger.warning(f"Failed to add field {safe_name}: {str(e)}")
-                
+        logger.info(f"Created Dify-compatible schema with {len(fields)} fields: {[f.name for f in fields]}")
         return fields
         
     def transform_document(self, weaviate_doc: Dict[str, Any], schema_analysis: Dict[str, Any] = None) -> Optional[Dict[str, Any]]:
-        """Transform a single Weaviate document to Zilliz format"""
+        """Transform a single Weaviate document to Dify-compatible Zilliz format"""
         try:
             # Extract basic components
             additional = weaviate_doc.get('_additional', {})
@@ -144,32 +123,20 @@ class DataTransformer:
             # Extract properties (everything except _additional)
             properties = {k: v for k, v in weaviate_doc.items() if k != '_additional'}
             
-            # Extract text content
+            # Extract text content for page_content field
             text_content = extract_text_content(properties)
             
-            # Create base Zilliz document
+            # Create Dify-compatible Zilliz document structure
             zilliz_doc = {
                 'id': str(doc_id),
-                'text': truncate_text(text_content),
+                'page_content': truncate_text(text_content),
                 'vector': vector,
-                'metadata': properties
+                'sparse_vector': {},  # Empty sparse vector as required
+                'metadata': properties  # Store all properties in metadata JSON field
             }
             
-            # Add individual properties as separate fields
-            if schema_analysis and 'properties' in schema_analysis:
-                for original_name, prop_info in schema_analysis['properties'].items():
-                    if original_name in properties:
-                        safe_name = prop_info['safe_name']
-                        value = properties[original_name]
-                        
-                        # Skip if field name conflicts
-                        if safe_name in ['id', 'text', 'vector', 'metadata']:
-                            continue
-                            
-                        # Transform value based on type
-                        transformed_value = self._transform_field_value(value, prop_info['zilliz_type'])
-                        if transformed_value is not None:
-                            zilliz_doc[safe_name] = transformed_value
+            # Note: No longer extracting individual properties as separate fields
+            # All data is stored in the metadata JSON field to match Dify structure
                             
             return zilliz_doc
             
@@ -222,8 +189,8 @@ class DataTransformer:
         
         for i, doc in enumerate(zilliz_docs):
             try:
-                # Check required fields
-                required_fields = ['id', 'text', 'vector', 'metadata']
+                # Check required fields for Dify-compatible structure
+                required_fields = ['id', 'page_content', 'vector', 'metadata']
                 missing_fields = [field for field in required_fields if field not in doc]
                 
                 if missing_fields:
@@ -240,8 +207,8 @@ class DataTransformer:
                     errors.append(f"Document {i}: ID too long")
                     continue
                     
-                if len(doc['text']) > 65535:
-                    doc['text'] = truncate_text(doc['text'])
+                if len(doc['page_content']) > 65535:
+                    doc['page_content'] = truncate_text(doc['page_content'])
                     
                 # Validate metadata is JSON serializable
                 try:
