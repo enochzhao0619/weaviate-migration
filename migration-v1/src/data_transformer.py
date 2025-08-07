@@ -126,13 +126,16 @@ class DataTransformer:
             # Extract text content for page_content field
             text_content = extract_text_content(properties)
             
+            # Create metadata without text field to avoid duplication with page_content
+            metadata = {k: v for k, v in properties.items() if k != 'text'}
+            
             # Create Dify-compatible Zilliz document structure
             zilliz_doc = {
                 'id': str(doc_id),
                 'page_content': truncate_text(text_content),
                 'vector': vector,
                 'sparse_vector': {},  # Empty sparse vector as required
-                'metadata': properties  # Store all properties in metadata JSON field
+                'metadata': metadata  # Store properties in metadata JSON field (excluding text)
             }
             
             # Note: No longer extracting individual properties as separate fields
