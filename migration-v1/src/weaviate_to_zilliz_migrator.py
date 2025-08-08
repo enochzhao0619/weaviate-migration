@@ -264,7 +264,6 @@ class WeaviateToZillizMigrator:
             self.zilliz_client.create_collection(
                 collection_name=collection_name,
                 schema=schema,
-                consistency_level="Strong"
             )
             
             # Create index on vector fields using prepare_index_params
