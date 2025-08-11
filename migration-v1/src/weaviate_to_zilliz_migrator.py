@@ -18,8 +18,11 @@ import time
 from tqdm import tqdm
 import numpy as np
 import requests
+import psycopg2
+import psycopg2.extras
 from data_transformer import DataTransformer
 from utils import retry_on_failure, log_memory_usage, create_safe_collection_name
+from report_generator import MigrationReportGenerator
 
 # Load environment variables
 load_dotenv()
@@ -51,6 +54,13 @@ class WeaviateToZillizMigrator:
         self.zilliz_token = os.getenv('ZILLIZ_CLOUD_API_KEY', '1f7f189111d65b5a28fa06dff3271af8453e682f3ac72449d9b5aec521d090645acc773cd8269521a38dabc5ae11fbe5e8fa48a1')
         self.zilliz_db_name = os.getenv('ZILLIZ_CLOUD_DATABASE', 'default')
         
+        # PostgreSQL configuration
+        self.pg_host = os.getenv('PG_HOST', 'localhost')
+        self.pg_port = int(os.getenv('PG_PORT', '5432'))
+        self.pg_database = os.getenv('PG_DATABASE', 'dify')
+        self.pg_username = os.getenv('PG_USERNAME', 'postgres')
+        self.pg_password = os.getenv('PG_PASSWORD', '')
+        
         # Migration configuration
         self.batch_size = int(os.getenv('MIGRATION_BATCH_SIZE', '300'))
         self.max_retries = int(os.getenv('MIGRATION_MAX_RETRIES', '3'))
@@ -62,11 +72,12 @@ class WeaviateToZillizMigrator:
         # Client instances
         self.weaviate_client = None
         self.zilliz_client = None
+        self.pg_connection = None
         
         # Data transformer
         self.transformer = DataTransformer()
         
-        # Migration statistics
+        # Migration statistics (legacy format for backward compatibility)
         self.migration_stats = {
             'start_time': None,
             'end_time': None,
@@ -77,6 +88,9 @@ class WeaviateToZillizMigrator:
             'total_documents': 0,
             'migrated_documents': 0
         }
+        
+        # Report generator for detailed reporting
+        self.report_generator = MigrationReportGenerator()
         
     # Removed thread-related methods - now only supports serial processing
         
@@ -89,12 +103,12 @@ class WeaviateToZillizMigrator:
                 self.weaviate_client = weaviate.Client(
                     url=self.weaviate_endpoint,
                     auth_client_secret=auth_config,
-                    timeout_config=(60, 60)  # (connect_timeout, read_timeout)
+                    timeout_config=(360, 360)  # (connect_timeout, read_timeout)
                 )
             else:
                 self.weaviate_client = weaviate.Client(
                     url=self.weaviate_endpoint,
-                    timeout_config=(60, 60)
+                    timeout_config=(360, 360)
                 )
             
             # Test connection
@@ -126,6 +140,153 @@ class WeaviateToZillizMigrator:
         except Exception as e:
             logger.error(f"Failed to connect to Zilliz Cloud: {str(e)}")
             raise
+            
+    def connect_postgresql(self):
+        """Establish connection to PostgreSQL database"""
+        try:
+            self.pg_connection = psycopg2.connect(
+                host=self.pg_host,
+                port=self.pg_port,
+                database=self.pg_database,
+                user=self.pg_username,
+                password=self.pg_password
+            )
+            self.pg_connection.autocommit = True
+            logger.info(f"Successfully connected to PostgreSQL at {self.pg_host}:{self.pg_port}")
+            
+        except Exception as e:
+            logger.error(f"Failed to connect to PostgreSQL: {str(e)}")
+            raise
+            
+    def _transform_class_name_to_dataset_id(self, class_name: str) -> str:
+        """Transform Weaviate class name to dataset ID format
+        
+        Removes prefix (Vector_index) and suffix (_Node), replaces _ with -
+        Example: Vector_index_3123e710_5583_4fd1_825d_0b748d495981_Node -> 3123e710-5583-4fd1-825d-0b748d495981
+        """
+        # Remove Vector_index prefix if exists
+        if class_name.startswith('Vector_index_'):
+            class_name = class_name[13:]  # Remove "Vector_index_"
+        
+        # Remove _Node suffix if exists
+        if class_name.endswith('_Node'):
+            class_name = class_name[:-5]  # Remove "_Node"
+        
+        # Replace underscores with hyphens
+        dataset_id = class_name.replace('_', '-')
+        
+        return dataset_id
+        
+    def update_pg_datasets_vector_store_type(self) -> Dict[str, Any]:
+        """Update PostgreSQL datasets table to change vector store type from weaviate to milvus
+        
+        Returns:
+            Dict containing update statistics and results
+        """
+        if not self.pg_connection:
+            raise Exception("PostgreSQL connection not established. Call connect_postgresql() first.")
+        
+        if not self.weaviate_client:
+            raise Exception("Weaviate connection not established. Call connect_weaviate() first.")
+        
+        logger.info("Starting PostgreSQL datasets vector store type update process")
+        
+        # Statistics tracking
+        stats = {
+            'total_weaviate_classes': 0,
+            'processed_datasets': 0,
+            'updated_datasets': 0,
+            'failed_updates': 0,
+            'not_found_datasets': 0,
+            'errors': []
+        }
+        
+        try:
+            # Step 1: Get all Weaviate classes
+            logger.info("Retrieving all Weaviate classes...")
+            weaviate_classes = self.get_weaviate_collections()
+            stats['total_weaviate_classes'] = len(weaviate_classes)
+            logger.info(f"Found {len(weaviate_classes)} Weaviate classes")
+            
+            # Step 2: Process each class
+            with self.pg_connection.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
+                for class_name in weaviate_classes:
+                    try:
+                        stats['processed_datasets'] += 1
+                        
+                        # Transform class name to dataset ID
+                        dataset_id = self._transform_class_name_to_dataset_id(class_name)
+                        logger.info(f"Processing class: {class_name} -> dataset ID: {dataset_id}")
+                        
+                        # Step 3: Query dataset by ID
+                        cursor.execute(
+                            "SELECT id, retrieval_model FROM datasets WHERE id = %s",
+                            (dataset_id,)
+                        )
+                        dataset = cursor.fetchone()
+                        
+                        if not dataset:
+                            stats['not_found_datasets'] += 1
+                            logger.warning(f"Dataset not found for ID: {dataset_id}")
+                            continue
+                        
+                        # Step 4: Parse and update retrieval_model
+                        retrieval_model = dataset['retrieval_model']
+                        if not retrieval_model:
+                            logger.warning(f"No retrieval_model found for dataset: {dataset_id}")
+                            continue
+                        
+                        # Check if it's weaviate type and has vector_store config
+                        if (isinstance(retrieval_model, dict) and 
+                            retrieval_model.get('type') == 'weaviate' and 
+                            'vector_store' in retrieval_model):
+                            
+                            # Update the type from weaviate to milvus
+                            retrieval_model['type'] = 'milvus'
+                            
+                            # Update the database
+                            cursor.execute(
+                                "UPDATE datasets SET retrieval_model = %s WHERE id = %s",
+                                (json.dumps(retrieval_model), dataset_id)
+                            )
+                            
+                            stats['updated_datasets'] += 1
+                            logger.info(f"✓ Updated dataset {dataset_id}: weaviate -> milvus")
+                            
+                        else:
+                            logger.info(f"Dataset {dataset_id} does not have weaviate vector store config, skipping")
+                        
+                    except Exception as e:
+                        stats['failed_updates'] += 1
+                        error_msg = f"Failed to update dataset for class {class_name}: {str(e)}"
+                        stats['errors'].append(error_msg)
+                        logger.error(error_msg)
+                        continue
+            
+            # Step 5: Log summary
+            logger.info("\n" + "="*60)
+            logger.info("POSTGRESQL DATASETS UPDATE SUMMARY")
+            logger.info("="*60)
+            logger.info(f"Total Weaviate classes: {stats['total_weaviate_classes']}")
+            logger.info(f"Processed datasets: {stats['processed_datasets']}")
+            logger.info(f"Successfully updated: {stats['updated_datasets']}")
+            logger.info(f"Not found datasets: {stats['not_found_datasets']}")
+            logger.info(f"Failed updates: {stats['failed_updates']}")
+            
+            if stats['errors']:
+                logger.warning(f"Errors encountered:")
+                for error in stats['errors'][:5]:  # Show first 5 errors
+                    logger.warning(f"  {error}")
+                if len(stats['errors']) > 5:
+                    logger.warning(f"  ... and {len(stats['errors']) - 5} more errors")
+            
+            return stats
+            
+        except Exception as e:
+            error_msg = f"Failed to update PostgreSQL datasets: {str(e)}"
+            logger.error(error_msg)
+            stats['errors'].append(error_msg)
+            raise Exception(error_msg)
             
     def get_weaviate_collections(self) -> List[str]:
         """Get all collection names from Weaviate using v3 client"""
@@ -569,13 +730,28 @@ class WeaviateToZillizMigrator:
                         logger.info(f"✓ Batch {batch_number} completed: {len(zilliz_data)} documents uploaded")
                         logger.info(f"Total migrated so far: {total_migrated}/{total_count if total_count > 0 else '?'}")
                         
+                        # Update report generator with successful batch
+                        self.report_generator.update_collection_progress(collection_name, len(zilliz_data), success=True)
+                        
                     else:
                         logger.warning(f"No valid data in batch {batch_number} after transformation")
                         
                 except Exception as e:
-                    logger.error(f"Failed to process batch {batch_number}: {str(e)}")
-                    # Continue with next batch instead of failing completely
-                    continue
+                    error_message = str(e)
+                    logger.error(f"Failed to process batch {batch_number}: {error_message}")
+                    
+                    # Update report generator with failed batch
+                    self.report_generator.update_collection_progress(collection_name, len(batch_data), success=False)
+                    self.report_generator.add_error("Batch Error", collection_name, f"Batch {batch_number}: {error_message}")
+                    
+                    # Check if this is a critical error that should fail the entire collection
+                    if self._is_critical_error(error_message):
+                        logger.error(f"Critical error encountered in batch {batch_number}, failing entire collection migration")
+                        raise Exception(f"Critical error in batch {batch_number}: {error_message}")
+                    else:
+                        # For non-critical errors, continue with next batch
+                        logger.warning(f"Non-critical error in batch {batch_number}, continuing with next batch")
+                        continue
                 
                 # Check exit conditions
                 if limit and total_migrated >= limit:
@@ -596,6 +772,93 @@ class WeaviateToZillizMigrator:
             logger.error(f"Serial batch migration failed for {collection_name}: {str(e)}")
             raise
 
+    def _get_collection_document_count(self, collection_name: str) -> int:
+        """Get document count from Weaviate collection efficiently"""
+        try:
+            count_query = self.weaviate_client.query.aggregate(collection_name).with_meta_count()
+            count_result = count_query.do()
+            if count_result and 'data' in count_result and 'Aggregate' in count_result['data']:
+                aggregate_data = count_result['data']['Aggregate'].get(collection_name, [])
+                if aggregate_data and len(aggregate_data) > 0:
+                    return aggregate_data[0].get('meta', {}).get('count', 0)
+            return 0
+        except Exception as e:
+            logger.warning(f"Failed to get document count for {collection_name}: {str(e)}")
+            return 0
+            
+    def _get_zilliz_collection_document_count(self, collection_name: str) -> int:
+        """Get document count from Zilliz collection"""
+        try:
+            stats = self.zilliz_client.get_collection_stats(collection_name)
+            return stats.get('rowCount', 0)
+        except Exception as e:
+            logger.warning(f"Failed to get Zilliz document count for {collection_name}: {str(e)}")
+            return 0
+            
+    def _is_critical_error(self, error_message: str) -> bool:
+        """Determine if an error is critical and should fail the entire collection migration"""
+        error_lower = error_message.lower()
+        
+        # Critical errors that indicate data integrity issues or system limitations
+        critical_error_patterns = [
+            # Field length/size violations
+            "exceeds max length",
+            "field length too long",
+            "varchar field",
+            "text field too long",
+            
+            # Data type violations  
+            "invalid data type",
+            "type mismatch",
+            "schema violation",
+            "invalid parameter",
+            
+            # System resource errors
+            "out of memory",
+            "memory limit exceeded",
+            "disk full",
+            "storage quota exceeded",
+            
+            # Authentication/authorization errors
+            "authentication failed",
+            "unauthorized",
+            "access denied",
+            "permission denied",
+            
+            # Collection/schema errors
+            "collection not found",
+            "schema error",
+            "index error",
+            
+            # Connection errors that are persistent
+            "connection refused",
+            "host unreachable",
+            "dns resolution failed"
+        ]
+        
+        # Check if error message contains any critical error patterns
+        for pattern in critical_error_patterns:
+            if pattern in error_lower:
+                return True
+                
+        # Non-critical errors (temporary network issues, rate limiting, etc.)
+        non_critical_patterns = [
+            "timeout",
+            "rate limit",
+            "throttling",
+            "temporary failure",
+            "retry",
+            "connection reset"
+        ]
+        
+        # If it's a known non-critical error, return False
+        for pattern in non_critical_patterns:
+            if pattern in error_lower:
+                return False
+                
+        # For unknown errors, default to critical to be safe
+        return True
+
     # Removed legacy migrate_collection_data method - now using batch processing
             
     def migrate_collection(self, collection_name: str, limit: int = None, collection_index: int = None, total_collections: int = None):
@@ -610,18 +873,31 @@ class WeaviateToZillizMigrator:
         
         try:
             # Step 1: Check if collection exists in Zilliz
-            logger.info(f"{progress_prefix}Step 1/3: Checking if collection exists in Zilliz Cloud...")
+            logger.info(f"{progress_prefix}Step 1/4: Checking if collection exists in Zilliz Cloud...")
             if self.zilliz_client.has_collection(collection_name):
                 logger.warning(f"{progress_prefix}Collection {collection_name} already exists in Zilliz Cloud, skipping migration")
+                # Still get schema and document count for reporting
+                schema_info = self.get_collection_schema(collection_name)
+                weaviate_doc_count = self._get_collection_document_count(collection_name)
+                self.report_generator.add_collection_start(collection_name, schema_info, weaviate_doc_count)
+                self.report_generator.set_collection_result(collection_name, 'skipped', 0, "Collection already exists in Zilliz")
                 return 0, True  # Return migrated count and skip status
             
-            # Step 2: Get collection schema
-            logger.info(f"{progress_prefix}Step 2/3: Retrieving collection schema from Weaviate...")
+            # Step 2: Get collection schema and document count
+            logger.info(f"{progress_prefix}Step 2/4: Retrieving collection schema and document count from Weaviate...")
             try:
                 schema_info = self.get_collection_schema(collection_name)
                 if not schema_info:
                     raise Exception("Empty schema retrieved")
                 logger.info(f"{progress_prefix}Successfully retrieved schema with {len(schema_info.get('properties', {}))} properties")
+                
+                # Get document count for reporting
+                weaviate_doc_count = self._get_collection_document_count(collection_name)
+                logger.info(f"{progress_prefix}Collection contains {weaviate_doc_count:,} documents")
+                
+                # Initialize collection in report generator
+                self.report_generator.add_collection_start(collection_name, schema_info, weaviate_doc_count)
+                
             except Exception as e:
                 error_msg = f"Failed to retrieve schema: {str(e)}"
                 if "timeout" in str(e).lower():
@@ -629,10 +905,11 @@ class WeaviateToZillizMigrator:
                 elif "not found" in str(e).lower():
                     error_msg += " (Collection not found in Weaviate)"
                 logger.error(f"{progress_prefix}{error_msg}")
+                self.report_generator.add_error("Schema Error", collection_name, error_msg)
                 raise Exception(error_msg)
             
             # Step 3: Start serial batch migration (collection creation happens in first batch)
-            logger.info(f"{progress_prefix}Step 3/3: Starting serial batch migration...")
+            logger.info(f"{progress_prefix}Step 3/4: Starting serial batch migration...")
             try:
                 # Log memory usage before migration
                 log_memory_usage()
@@ -640,12 +917,19 @@ class WeaviateToZillizMigrator:
                 # Use serial batch migration with integrated collection creation
                 migrated_count = self.migrate_collection_batch_by_batch(collection_name, schema_info, limit=limit)
                 
+                # Step 4: Verify migration and get final document count
+                logger.info(f"{progress_prefix}Step 4/4: Verifying migration...")
+                zilliz_doc_count = self._get_zilliz_collection_document_count(collection_name)
+                
                 if migrated_count > 0:
                     logger.info(f"{progress_prefix}✓ Successfully migrated {migrated_count} documents in {collection_name}")
+                    self.report_generator.set_collection_result(collection_name, 'success', zilliz_doc_count)
                 else:
                     logger.warning(f"{progress_prefix}⚠ No documents were migrated for {collection_name}")
+                    self.report_generator.set_collection_result(collection_name, 'success', zilliz_doc_count)
                     
                 return migrated_count, False  # Return migrated count and not skipped
+                
             except Exception as e:
                 error_msg = f"Failed to migrate documents: {str(e)}"
                 if "timeout" in str(e).lower():
@@ -657,10 +941,16 @@ class WeaviateToZillizMigrator:
                 elif "quota" in str(e).lower():
                     error_msg += " (Storage quota exceeded in Zilliz Cloud)"
                 logger.error(f"{progress_prefix}{error_msg}")
+                self.report_generator.add_error("Migration Error", collection_name, error_msg)
+                self.report_generator.set_collection_result(collection_name, 'failed', 0, error_msg)
                 raise Exception(error_msg)
             
         except Exception as e:
             logger.error(f"{progress_prefix}✗ Failed to migrate collection {collection_name}: {str(e)}")
+            # Ensure collection is marked as failed in report if not already done
+            if collection_name not in [c['name'] for c in self.report_generator.migration_data['collections'].values()]:
+                self.report_generator.add_collection_start(collection_name, {}, 0)
+            self.report_generator.set_collection_result(collection_name, 'failed', 0, str(e))
             raise
             
     def verify_migration(self, collection_name: str) -> bool:
@@ -749,7 +1039,18 @@ class WeaviateToZillizMigrator:
         if limit:
             logger.info(f"Limiting migration to {limit} documents per collection")
             
-        self.migration_stats['start_time'] = datetime.now()
+        start_time = datetime.now()
+        self.migration_stats['start_time'] = start_time
+        
+        # Initialize report generator with migration configuration
+        config_info = {
+            'weaviate_endpoint': self.weaviate_endpoint,
+            'zilliz_uri': self.zilliz_uri,
+            'batch_size': self.batch_size,
+            'max_retries': self.max_retries
+        }
+        self.report_generator.set_migration_start(start_time, config_info)
+        
         try:
             # Connect to both systems
             self.connect_weaviate()
@@ -821,10 +1122,35 @@ class WeaviateToZillizMigrator:
                     elif "quota" in str(e).lower() or "limit" in str(e).lower():
                         logger.error(f"[{index}/{len(collections)}] Quota/limit error - check Zilliz Cloud usage limits")
                 
-            self.migration_stats['end_time'] = datetime.now()
+            end_time = datetime.now()
+            self.migration_stats['end_time'] = end_time
+            self.report_generator.set_migration_end(end_time)
             
             # Print summary
             self._print_migration_summary()
+            
+            # Generate comprehensive reports
+            logger.info("\n" + "="*60)
+            logger.info("GENERATING MIGRATION REPORTS")
+            logger.info("="*60)
+            
+            try:
+                report_files = self.report_generator.generate_all_reports()
+                
+                if report_files:
+                    logger.info("Migration reports generated successfully:")
+                    for report_type, file_path in report_files.items():
+                        logger.info(f"  {report_type.upper()}: {file_path}")
+                        
+                    # Highlight the HTML report for easy access
+                    if 'html' in report_files:
+                        logger.info(f"\n📊 Open the HTML report for detailed results: {report_files['html']}")
+                else:
+                    logger.warning("No reports were generated successfully")
+                    
+            except Exception as e:
+                logger.error(f"Failed to generate migration reports: {str(e)}")
+                logger.debug("Report generation error details:", exc_info=True)
             
         except Exception as e:
             logger.error(f"Migration process failed: {str(e)}")
@@ -883,16 +1209,28 @@ def main():
     # Create migrator instance
     migrator = WeaviateToZillizMigrator()
     
-    # Check if user wants to load all collections
+    # Check if user wants to load all collections or update PostgreSQL datasets
     import sys
-    if len(sys.argv) > 1 and sys.argv[1] == 'load_collections':
-        try:
-            migrator.connect_zilliz()
-            migrator.load_all_collections()
-        except Exception as e:
-            logger.error(f"Failed to load collections: {str(e)}")
-            sys.exit(1)
-        return
+    if len(sys.argv) > 1:
+        if sys.argv[1] == 'load_collections':
+            try:
+                migrator.connect_zilliz()
+                migrator.load_all_collections()
+            except Exception as e:
+                logger.error(f"Failed to load collections: {str(e)}")
+                sys.exit(1)
+            return
+        elif sys.argv[1] == 'update_pg_datasets':
+            try:
+                migrator.connect_weaviate()
+                migrator.connect_postgresql()
+                stats = migrator.update_pg_datasets_vector_store_type()
+                logger.info("PostgreSQL datasets update completed successfully")
+                logger.info(f"Updated {stats['updated_datasets']} datasets")
+            except Exception as e:
+                logger.error(f"Failed to update PostgreSQL datasets: {str(e)}")
+                sys.exit(1)
+            return
     
     # Run migration
     try:
