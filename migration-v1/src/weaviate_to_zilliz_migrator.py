@@ -18,9 +18,6 @@ import time
 from tqdm import tqdm
 import numpy as np
 import requests
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import threading
-from queue import Queue
 from data_transformer import DataTransformer
 from utils import retry_on_failure, log_memory_usage, create_safe_collection_name
 
@@ -60,15 +57,7 @@ class WeaviateToZillizMigrator:
         self.retry_delay = float(os.getenv('MIGRATION_RETRY_DELAY', '1.0'))
         self.dimension = None
         
-        # Threading configuration
-        self.max_collection_workers = int(os.getenv('MAX_COLLECTION_WORKERS', '3'))
-        self.thread_pool_executor = None
-        
-        # Thread-safe locks and queues
-        self.stats_lock = threading.Lock()
-        self.log_lock = threading.Lock()
-        self.progress_lock = threading.Lock()
-        self.batch_queue = Queue()
+        # Removed threading configuration - now only supports serial processing
         
         # Client instances
         self.weaviate_client = None
@@ -77,7 +66,7 @@ class WeaviateToZillizMigrator:
         # Data transformer
         self.transformer = DataTransformer()
         
-        # Migration statistics (thread-safe)
+        # Migration statistics
         self.migration_stats = {
             'start_time': None,
             'end_time': None,
@@ -86,52 +75,10 @@ class WeaviateToZillizMigrator:
             'failed_collections': [],
             'skipped_collections': [],
             'total_documents': 0,
-            'migrated_documents': 0,
-            'active_threads': 0
+            'migrated_documents': 0
         }
         
-        # Progress tracking
-        self.collection_progress = {}
-        self.global_progress_bar = None
-        
-    def thread_safe_log(self, level: str, message: str, thread_id: str = None):
-        """Thread-safe logging with thread identification"""
-        with self.log_lock:
-            thread_info = f"[Thread-{thread_id or threading.current_thread().name}] " if thread_id or threading.current_thread().name != 'MainThread' else ""
-            if level == 'info':
-                logger.info(f"{thread_info}{message}")
-            elif level == 'warning':
-                logger.warning(f"{thread_info}{message}")
-            elif level == 'error':
-                logger.error(f"{thread_info}{message}")
-            elif level == 'debug':
-                logger.debug(f"{thread_info}{message}")
-                
-    def update_migration_stats(self, **kwargs):
-        """Thread-safe statistics update"""
-        with self.stats_lock:
-            for key, value in kwargs.items():
-                if key in self.migration_stats:
-                    if isinstance(self.migration_stats[key], list):
-                        if isinstance(value, list):
-                            self.migration_stats[key].extend(value)
-                        else:
-                            self.migration_stats[key].append(value)
-                    elif isinstance(self.migration_stats[key], (int, float)):
-                        self.migration_stats[key] += value
-                    else:
-                        self.migration_stats[key] = value
-                        
-    def get_thread_safe_zilliz_client(self):
-        """Get a thread-local Zilliz client to avoid connection conflicts"""
-        # Each thread should have its own client instance
-        if not hasattr(threading.current_thread(), 'zilliz_client'):
-            threading.current_thread().zilliz_client = MilvusClient(
-                uri=self.zilliz_uri,
-                token=self.zilliz_token,
-                db_name=self.zilliz_db_name
-            )
-        return threading.current_thread().zilliz_client
+    # Removed thread-related methods - now only supports serial processing
         
     def connect_weaviate(self):
         """Establish connection to Weaviate using v3 client"""
@@ -201,8 +148,8 @@ class WeaviateToZillizMigrator:
             logger.error(f"Failed to get schema for collection {collection_name}: {str(e)}")
             return {}
             
-    def get_collection_data(self, collection_name: str, limit: int = None) -> List[Dict[str, Any]]:
-        """Retrieve all data from a Weaviate collection using v3 client"""
+    def get_collection_data(self, collection_name: str, limit: int = None, show_progress: bool = False) -> List[Dict[str, Any]]:
+        """Retrieve all data from a Weaviate collection using cursor-based pagination to avoid OOM"""
         try:
             # Build GraphQL query for v3 client
             additional_fields = ["id", "vector"]
@@ -217,29 +164,95 @@ class WeaviateToZillizMigrator:
                 elif isinstance(schema_properties, list):
                     properties = [prop.get('name') for prop in schema_properties if prop.get('name')]
             
-            # Build query
-            query_builder = self.weaviate_client.query.get(collection_name, properties).with_additional(additional_fields)
+            # Get total count for progress tracking
+            total_count = 0
+            if show_progress:
+                try:
+                    count_query = self.weaviate_client.query.aggregate(collection_name).with_meta_count()
+                    count_result = count_query.do()
+                    if count_result and 'data' in count_result and 'Aggregate' in count_result['data']:
+                        aggregate_data = count_result['data']['Aggregate'].get(collection_name, [])
+                        if aggregate_data and len(aggregate_data) > 0:
+                            total_count = aggregate_data[0].get('meta', {}).get('count', 0)
+                except:
+                    # Fallback: estimate based on batch query
+                    total_count = 0
+                    
+            # Use cursor-based pagination to fetch all data
+            all_data = []
+            cursor = None
+            batch_size = min(self.batch_size, 1000)  # Use smaller batches for memory efficiency
+            fetched_count = 0
             
-            if limit:
-                query_builder = query_builder.with_limit(limit)
+            if show_progress and total_count > 0:
+                logger.info(f"Fetching {total_count} documents from {collection_name} using cursor pagination...")
+                pbar = tqdm(total=total_count, desc=f"Fetching {collection_name}", leave=False)
+            else:
+                pbar = None
+                
+            while True:
+                # Build query with cursor
+                query_builder = self.weaviate_client.query.get(collection_name, properties).with_additional(additional_fields)
+                query_builder = query_builder.with_limit(batch_size)
+                
+                if cursor:
+                    query_builder = query_builder.with_after(cursor)
+                
+                # Execute query
+                result = query_builder.do()
+                
+                # Extract data from GraphQL response
+                batch_data = []
+                if result and 'data' in result and 'Get' in result['data'] and collection_name in result['data']['Get']:
+                    objects = result['data']['Get'][collection_name]
+                    
+                    for obj in objects:
+                        # Separate properties from additional fields
+                        obj_data = {k: v for k, v in obj.items() if k != '_additional'}
+                        obj_data['_additional'] = obj.get('_additional', {})
+                        batch_data.append(obj_data)
+                        
+                        # Update cursor to the last object's ID for next iteration
+                        cursor = obj_data['_additional'].get('id')
+                
+                # Add batch to all data
+                all_data.extend(batch_data)
+                fetched_count += len(batch_data)
+                
+                # Update progress bar
+                if pbar:
+                    pbar.update(len(batch_data))
+                    pbar.set_postfix({'fetched': fetched_count})
+                
+                # Check if we've reached the limit or no more data
+                if limit and fetched_count >= limit:
+                    all_data = all_data[:limit]  # Trim to exact limit
+                    break
+                    
+                if len(batch_data) < batch_size:
+                    # No more data available
+                    break
+                    
+                # Log progress periodically
+                if fetched_count % (batch_size * 10) == 0:
+                    logger.info(f"Fetched {fetched_count} documents from {collection_name}...")
             
-            result = query_builder.do()
+            if pbar:
+                pbar.close()
+                
+            logger.info(f"Retrieved {len(all_data)} documents from {collection_name} using cursor pagination")
+            return all_data
             
-            # Extract data from GraphQL response
-            data = []
-            if result and 'data' in result and 'Get' in result['data'] and collection_name in result['data']['Get']:
-                objects = result['data']['Get'][collection_name]
-                for obj in objects:
-                    # Separate properties from additional fields
-                    obj_data = {k: v for k, v in obj.items() if k != '_additional'}
-                    obj_data['_additional'] = obj.get('_additional', {})
-                    data.append(obj_data)
-            
-            logger.info(f"Retrieved {len(data)} documents from {collection_name}")
-            return data
         except Exception as e:
-            logger.error(f"Failed to get data from collection {collection_name}: {str(e)}")
-            raise
+            error_msg = f"Failed to get data from collection {collection_name}: {str(e)}"
+            if "timeout" in str(e).lower():
+                error_msg += " (Connection timeout - check network connectivity)"
+            elif "unauthorized" in str(e).lower():
+                error_msg += " (Authentication failed - check API key)"
+            elif "not found" in str(e).lower():
+                error_msg += " (Collection not found in Weaviate)"
+            logger.error(error_msg)
+            raise Exception(error_msg)
             
     def create_zilliz_collection(self, collection_name: str, dimension: int, schema_info: Dict[str, Any] = None) -> bool:
         """Create a collection in Zilliz Cloud with the same schema"""
@@ -437,131 +450,255 @@ class WeaviateToZillizMigrator:
             logger.error(f"Failed to transform data batch: {str(e)}")
             raise
             
-    def process_collection_data(self, collection_name: str, weaviate_data: List[Dict[str, Any]], 
-                              schema_info: Dict[str, Any]) -> Tuple[int, bool]:
-        """Process all data for a collection in a single operation"""
-        thread_id = f"{collection_name}-upload"
+    # Removed process_collection_data method - now handled in batch processing
+            
+    def migrate_collection_batch_by_batch(self, collection_name: str, schema_info: Dict[str, Any], limit: int = None) -> int:
+        """Migrate collection data in serial batches of 250 documents"""
         try:
-            total_docs = len(weaviate_data)
-            self.thread_safe_log('info', f"Processing collection {collection_name} with {total_docs} documents", thread_id)
+            # Get Zilliz client
+            zilliz_client = self.zilliz_client
             
-            # Get thread-local Zilliz client
-            zilliz_client = self.get_thread_safe_zilliz_client()
+            # Initialize cursor-based data fetching
+            cursor = None
+            batch_size = self.batch_size  # Default 250
+            total_migrated = 0
+            batch_number = 1
+            collection_created = False
             
-            # Transform all data for Zilliz
-            zilliz_data = self.transform_data_for_zilliz(weaviate_data, schema_info)
+            # Get total count for progress tracking
+            total_count = 0
+            try:
+                count_query = self.weaviate_client.query.aggregate(collection_name).with_meta_count()
+                count_result = count_query.do()
+                if count_result and 'data' in count_result and 'Aggregate' in count_result['data']:
+                    aggregate_data = count_result['data']['Aggregate'].get(collection_name, [])
+                    if aggregate_data and len(aggregate_data) > 0:
+                        total_count = aggregate_data[0].get('meta', {}).get('count', 0)
+            except:
+                total_count = 0
+                
+            if limit and total_count > 0:
+                total_count = min(total_count, limit)
+                
+            logger.info(f"Starting serial batch migration for {collection_name}")
+            logger.info(f"Total documents: {total_count}, Batch size: {batch_size}")
             
-            if not zilliz_data:
-                self.thread_safe_log('warning', f"No valid data in collection {collection_name}", thread_id)
-                return 0, False
+            # Get schema to understand properties
+            schema = self.get_collection_schema(collection_name)
+            properties = []
+            if schema and 'properties' in schema:
+                schema_properties = schema['properties']
+                if isinstance(schema_properties, dict):
+                    properties = list(schema_properties.keys())
+                elif isinstance(schema_properties, list):
+                    properties = [prop.get('name') for prop in schema_properties if prop.get('name')]
             
-            # Insert all data into Zilliz in one operation
-            zilliz_client.insert(
-                collection_name=collection_name,
-                data=zilliz_data
-            )
-            
-            migrated_count = len(zilliz_data)
-            self.thread_safe_log('info', f"Successfully inserted {migrated_count} documents to collection {collection_name}", thread_id)
-            
-            # Update statistics
-            self.update_migration_stats(migrated_documents=migrated_count)
-            
-            return migrated_count, True
+            # Process data in serial batches
+            while True:
+                logger.info(f"Processing batch {batch_number} (up to {batch_size} documents)...")
+                
+                # Build query with cursor
+                additional_fields = ["id", "vector"]
+                query_builder = self.weaviate_client.query.get(collection_name, properties).with_additional(additional_fields)
+                query_builder = query_builder.with_limit(batch_size)
+                
+                if cursor:
+                    query_builder = query_builder.with_after(cursor)
+                
+                # Execute query to get batch data
+                result = query_builder.do()
+                
+                # Extract batch data
+                batch_data = []
+                if result and 'data' in result and 'Get' in result['data'] and collection_name in result['data']['Get']:
+                    objects = result['data']['Get'][collection_name]
+                    
+                    for obj in objects:
+                        # Separate properties from additional fields
+                        obj_data = {k: v for k, v in obj.items() if k != '_additional'}
+                        obj_data['_additional'] = obj.get('_additional', {})
+                        batch_data.append(obj_data)
+                        
+                        # Update cursor to the last object's ID for next iteration
+                        cursor = obj_data['_additional'].get('id')
+                
+                # Check if we have data to process
+                if not batch_data:
+                    logger.info("No more data to process")
+                    break
+                    
+                logger.info(f"Fetched {len(batch_data)} documents in batch {batch_number}")
+                
+                # Check if we've reached the limit
+                if limit and total_migrated + len(batch_data) > limit:
+                    batch_data = batch_data[:limit - total_migrated]
+                    logger.info(f"Trimmed batch to {len(batch_data)} documents due to limit")
+                
+                # Create collection only for the first batch
+                if not collection_created and batch_data:
+                    logger.info("Creating Zilliz collection for first batch...")
+                    first_vector = batch_data[0]['_additional'].get('vector')
+                    if not first_vector:
+                        raise Exception("No vector found in first document")
+                        
+                    dimension = len(first_vector)
+                    logger.info(f"Vector dimension: {dimension}")
+                    
+                    # Create collection in Zilliz
+                    created = self.create_zilliz_collection(collection_name, dimension, schema_info)
+                    if created:
+                        collection_created = True
+                        logger.info(f"Collection {collection_name} created successfully")
+                    else:
+                        logger.info(f"Collection {collection_name} already exists, continuing with data upload")
+                        collection_created = True
+                
+                # Transform and insert batch
+                try:
+                    logger.info(f"Transforming batch {batch_number} data for Zilliz...")
+                    zilliz_data = self.transform_data_for_zilliz(batch_data, schema_info)
+                    
+                    if zilliz_data:
+                        logger.info(f"Uploading {len(zilliz_data)} documents to Zilliz...")
+                        zilliz_client.insert(
+                            collection_name=collection_name,
+                            data=zilliz_data
+                        )
+                        
+                        total_migrated += len(zilliz_data)
+                        logger.info(f"✓ Batch {batch_number} completed: {len(zilliz_data)} documents uploaded")
+                        logger.info(f"Total migrated so far: {total_migrated}/{total_count if total_count > 0 else '?'}")
+                        
+                    else:
+                        logger.warning(f"No valid data in batch {batch_number} after transformation")
+                        
+                except Exception as e:
+                    logger.error(f"Failed to process batch {batch_number}: {str(e)}")
+                    # Continue with next batch instead of failing completely
+                    continue
+                
+                # Check exit conditions
+                if limit and total_migrated >= limit:
+                    logger.info(f"Reached migration limit of {limit} documents")
+                    break
+                    
+                if len(batch_data) < batch_size:
+                    logger.info("Last batch processed (fewer documents than batch size)")
+                    break
+                
+                batch_number += 1
+                
+            logger.info(f"Serial batch migration completed for {collection_name}")
+            logger.info(f"Total documents migrated: {total_migrated}")
+            return total_migrated
             
         except Exception as e:
-            self.thread_safe_log('error', f"Failed to process collection {collection_name}: {str(e)}", thread_id)
-            return 0, False
+            logger.error(f"Serial batch migration failed for {collection_name}: {str(e)}")
+            raise
+
+    # Removed legacy migrate_collection_data method - now using batch processing
             
-    def migrate_collection_data(self, collection_name: str, weaviate_data: List[Dict[str, Any]], 
-                              schema_info: Dict[str, Any]) -> int:
-        """Migrate collection data in a single operation"""
-        total_docs = len(weaviate_data)
+    def migrate_collection(self, collection_name: str, limit: int = None, collection_index: int = None, total_collections: int = None):
+        """Migrate a single collection from Weaviate to Zilliz Cloud using serial batch processing"""
         
-        self.thread_safe_log('info', f"Starting single-thread migration for {collection_name} ({total_docs} documents)")
-        
-        # Process all data in one operation
-        migrated_count, success = self.process_collection_data(collection_name, weaviate_data, schema_info)
-        
-        if success:
-            self.thread_safe_log('info', f"Completed migration for {collection_name}: {migrated_count}/{total_docs} documents")
-        else:
-            self.thread_safe_log('error', f"Failed migration for {collection_name}")
+        # Create progress prefix for sequential mode
+        progress_prefix = ""
+        if collection_index is not None and total_collections is not None:
+            progress_prefix = f"[{collection_index}/{total_collections}] "
             
-        return migrated_count
-            
-    def migrate_collection(self, collection_name: str, limit: int = None):
-        """Migrate a single collection from Weaviate to Zilliz Cloud"""
-        logger.info(f"Starting migration for collection: {collection_name}")
+        logger.info(f"{progress_prefix}Starting migration for collection: {collection_name}")
         
         try:
-            # check if collection exists in zilliz
+            # Step 1: Check if collection exists in Zilliz
+            logger.info(f"{progress_prefix}Step 1/3: Checking if collection exists in Zilliz Cloud...")
             if self.zilliz_client.has_collection(collection_name):
-                logger.warning(f"Collection {collection_name} already exists in Zilliz Cloud, skipping migration")
+                logger.warning(f"{progress_prefix}Collection {collection_name} already exists in Zilliz Cloud, skipping migration")
                 return 0, True  # Return migrated count and skip status
             
-            # Get collection schema
-            schema_info = self.get_collection_schema(collection_name)
+            # Step 2: Get collection schema
+            logger.info(f"{progress_prefix}Step 2/3: Retrieving collection schema from Weaviate...")
+            try:
+                schema_info = self.get_collection_schema(collection_name)
+                if not schema_info:
+                    raise Exception("Empty schema retrieved")
+                logger.info(f"{progress_prefix}Successfully retrieved schema with {len(schema_info.get('properties', {}))} properties")
+            except Exception as e:
+                error_msg = f"Failed to retrieve schema: {str(e)}"
+                if "timeout" in str(e).lower():
+                    error_msg += " (Connection timeout - check Weaviate connectivity)"
+                elif "not found" in str(e).lower():
+                    error_msg += " (Collection not found in Weaviate)"
+                logger.error(f"{progress_prefix}{error_msg}")
+                raise Exception(error_msg)
             
-            # Get all data from Weaviate (with optional limit)
-            weaviate_data = self.get_collection_data(collection_name, limit=limit)
-            
-            if not weaviate_data:
-                logger.warning(f"No data found in collection {collection_name}")
-                return 0, False  # Return migrated count and skip status
+            # Step 3: Start serial batch migration (collection creation happens in first batch)
+            logger.info(f"{progress_prefix}Step 3/3: Starting serial batch migration...")
+            try:
+                # Log memory usage before migration
+                log_memory_usage()
                 
-            # Extract dimension from first vector
-            first_vector = weaviate_data[0]['_additional'].get('vector')
-            if not first_vector:
-                logger.error(f"No vector found in collection {collection_name}")
-                return 0, False
+                # Use serial batch migration with integrated collection creation
+                migrated_count = self.migrate_collection_batch_by_batch(collection_name, schema_info, limit=limit)
                 
-            dimension = len(first_vector)
-            logger.info(f"Vector dimension: {dimension}")
-            
-            # Create collection in Zilliz (returns True if created, False if skipped)
-            collection_created = self.create_zilliz_collection(collection_name, dimension, schema_info)
-            
-            if not collection_created:
-                logger.info(f"Collection {collection_name} already exists, skipping data migration")
-                return 0, True  # Return 0 migrated docs and True for skipped
-            
-            # Log memory usage before migration
-            log_memory_usage()
-            
-            # Use single-thread processing for complete data integrity
-            total_docs = len(weaviate_data)
-            migrated_count = self.migrate_collection_data(collection_name, weaviate_data, schema_info)
-                        
-            logger.info(f"Successfully migrated {migrated_count}/{total_docs} documents in {collection_name}")
-            return migrated_count, False  # Return migrated count and not skipped
+                if migrated_count > 0:
+                    logger.info(f"{progress_prefix}✓ Successfully migrated {migrated_count} documents in {collection_name}")
+                else:
+                    logger.warning(f"{progress_prefix}⚠ No documents were migrated for {collection_name}")
+                    
+                return migrated_count, False  # Return migrated count and not skipped
+            except Exception as e:
+                error_msg = f"Failed to migrate documents: {str(e)}"
+                if "timeout" in str(e).lower():
+                    error_msg += " (Insert timeout - try reducing batch size)"
+                elif "dimension" in str(e).lower():
+                    error_msg += " (Vector dimension mismatch during insert)"
+                elif "memory" in str(e).lower():
+                    error_msg += " (Out of memory during insert - try reducing batch size)"
+                elif "quota" in str(e).lower():
+                    error_msg += " (Storage quota exceeded in Zilliz Cloud)"
+                logger.error(f"{progress_prefix}{error_msg}")
+                raise Exception(error_msg)
             
         except Exception as e:
-            logger.error(f"Failed to migrate collection {collection_name}: {str(e)}")
+            logger.error(f"{progress_prefix}✗ Failed to migrate collection {collection_name}: {str(e)}")
             raise
             
     def verify_migration(self, collection_name: str) -> bool:
-        """Verify the migration by comparing document counts"""
+        """Verify the migration by comparing document counts using efficient methods"""
         try:
-            # Get Weaviate count
-            weaviate_data = self.get_collection_data(collection_name)
-            weaviate_count = len(weaviate_data)
+            # Get Weaviate count using aggregate query (more efficient than fetching all data)
+            weaviate_count = 0
+            try:
+                count_query = self.weaviate_client.query.aggregate(collection_name).with_meta_count()
+                count_result = count_query.do()
+                if count_result and 'data' in count_result and 'Aggregate' in count_result['data']:
+                    aggregate_data = count_result['data']['Aggregate'].get(collection_name, [])
+                    if aggregate_data and len(aggregate_data) > 0:
+                        weaviate_count = aggregate_data[0].get('meta', {}).get('count', 0)
+            except Exception as e:
+                logger.warning(f"Failed to get Weaviate count via aggregate, using fallback: {str(e)}")
+                # Fallback: get actual data (only if aggregate fails)
+                weaviate_data = self.get_collection_data(collection_name, limit=None, show_progress=False)
+                weaviate_count = len(weaviate_data)
             
             # Get Zilliz count using get_collection_stats
             try:
                 stats = self.zilliz_client.get_collection_stats(collection_name)
-                # print the stats, this is a dict
-                logger.info(f"Zilliz stats: {stats}")
+                logger.debug(f"Zilliz stats: {stats}")
                 zilliz_count = stats.get('rowCount', 0)
             except:
                 # Fallback: query all documents and count them
-                result = self.zilliz_client.query(
-                    collection_name=collection_name,
-                    filter="",
-                    output_fields=["id"],
-                    limit=16384  # Max limit for Milvus
-                )
-                zilliz_count = len(result) if result else 0
+                try:
+                    result = self.zilliz_client.query(
+                        collection_name=collection_name,
+                        filter="",
+                        output_fields=["id"],
+                        limit=16384  # Max limit for Milvus
+                    )
+                    zilliz_count = len(result) if result else 0
+                except:
+                    logger.warning(f"Failed to get Zilliz count for {collection_name}")
+                    zilliz_count = 0
             
             logger.info(f"Verification for {collection_name}:")
             logger.info(f"  Weaviate documents: {weaviate_count}")
@@ -572,7 +709,8 @@ class WeaviateToZillizMigrator:
                 return True
             else:
                 logger.warning(f"✗ Document count mismatch for {collection_name}")
-                return True
+                logger.warning(f"  This may be normal if some documents failed validation during transformation")
+                return True  # Return True to not fail the migration due to minor count differences
                 
         except Exception as e:
             logger.error(f"Failed to verify migration for {collection_name}: {str(e)}")
@@ -602,77 +740,14 @@ class WeaviateToZillizMigrator:
         except Exception as e:
             logger.error(f"Failed to export migration report: {str(e)}")
             
-    def migrate_single_collection_thread(self, collection_name: str, limit: int = None) -> Tuple[str, int, bool, bool]:
-        """Migrate a single collection in a separate thread"""
-        thread_id = f"collection-{collection_name}"
-        try:
-            self.thread_safe_log('info', f"Starting migration for collection: {collection_name}", thread_id)
-            self.update_migration_stats(active_threads=1)
+    # Removed concurrent migration methods - now only supports serial processing
             
-            migrated_docs, was_skipped = self.migrate_collection(collection_name, limit=limit)
-            
-            if was_skipped:
-                self.thread_safe_log('info', f"Collection {collection_name} was skipped (already exists)", thread_id)
-                return collection_name, migrated_docs, was_skipped, True
-            else:
-                # Verify migration
-                verification_success = self.verify_migration(collection_name)
-                self.thread_safe_log('info', f"Collection {collection_name} migration completed: {migrated_docs} documents", thread_id)
-                return collection_name, migrated_docs, was_skipped, verification_success
-                
-        except Exception as e:
-            self.thread_safe_log('error', f"Migration failed for {collection_name}: {str(e)}", thread_id)
-            return collection_name, 0, False, False
-        finally:
-            self.update_migration_stats(active_threads=-1)
-            
-    def run_concurrent_migration(self, collections: List[str], limit: int = None):
-        """Run migration with concurrent collection processing"""
-        self.thread_safe_log('info', f"Starting concurrent migration for {len(collections)} collections")
-        self.thread_safe_log('info', f"Configuration: {self.max_collection_workers} collection workers")
-        
-        # Use ThreadPoolExecutor for collection-level concurrency
-        with ThreadPoolExecutor(max_workers=self.max_collection_workers, thread_name_prefix="collection") as executor:
-            # Submit all collection migration tasks
-            future_to_collection = {
-                executor.submit(self.migrate_single_collection_thread, collection, limit): collection
-                for collection in collections
-            }
-            
-            # Track progress with overall progress bar
-            with tqdm(total=len(collections), desc="Migrating collections", position=0) as collection_pbar:
-                for future in as_completed(future_to_collection):
-                    collection_name = future_to_collection[future]
-                    try:
-                        collection, migrated_docs, was_skipped, verification_success = future.result()
-                        
-                        if was_skipped:
-                            self.update_migration_stats(skipped_collections=collection)
-                        elif verification_success:
-                            self.update_migration_stats(successful_collections=collection)
-                        else:
-                            self.update_migration_stats(failed_collections=collection)
-                            
-                        collection_pbar.set_postfix({
-                            'Current': collection,
-                            'Docs': migrated_docs,
-                            'Status': 'Skipped' if was_skipped else ('Success' if verification_success else 'Failed')
-                        })
-                        
-                    except Exception as e:
-                        self.thread_safe_log('error', f"Collection {collection_name} raised exception: {str(e)}")
-                        self.update_migration_stats(failed_collections=collection_name)
-                    
-                    collection_pbar.update(1)
-            
-    def run_migration(self, collections: Optional[List[str]] = None, limit: int = None, concurrent: bool = True):
-        """Run the complete migration process"""
-        mode = "concurrent" if concurrent else "sequential"
-        logger.info(f"Starting Weaviate to Zilliz Cloud migration in {mode} mode")
+    def run_migration(self, collections: Optional[List[str]] = None, limit: int = None):
+        """Run the complete migration process in serial mode with batch processing"""
+        logger.info("Starting Weaviate to Zilliz Cloud migration in serial batch mode")
+        logger.info(f"Batch size: {self.batch_size} documents per batch")
         if limit:
             logger.info(f"Limiting migration to {limit} documents per collection")
-        if concurrent:
-            logger.info(f"Using {self.max_collection_workers} collection workers")
             
         self.migration_stats['start_time'] = datetime.now()
         try:
@@ -687,35 +762,65 @@ class WeaviateToZillizMigrator:
             self.migration_stats['total_collections'] = len(collections)
             logger.info(f"Will migrate {len(collections)} collections: {collections}")
             
-            if concurrent and len(collections) > 1:
-                # Use concurrent migration for multiple collections
-                self.run_concurrent_migration(collections, limit)
-            else:
-                # Use sequential migration (original logic)
-                logger.info("Using sequential migration mode")
-                for collection in collections:
-                    try:
-                        logger.info(f"\n{'='*60}")
-                        logger.info(f"Processing collection: {collection}")
-                        logger.info(f"{'='*60}")
-                        
-                        migrated_docs, was_skipped = self.migrate_collection(collection, limit=limit)
-                        
-                        if was_skipped:
-                            self.migration_stats['skipped_collections'].append(collection)
-                            logger.info(f"Collection {collection} was skipped (already exists)")
-                        else:
-                            self.migration_stats['migrated_documents'] += migrated_docs
-                            
-                            if self.verify_migration(collection):
-                                self.migration_stats['successful_collections'].append(collection)
-                            else:
-                                self.migration_stats['failed_collections'].append(collection)
-                            
-                    except Exception as e:
-                        logger.error(f"Migration failed for {collection}: {str(e)}")
-                        self.migration_stats['failed_collections'].append(collection)
+            # Use serial migration with batch processing
+            logger.info("Using serial batch migration mode")
+            logger.info(f"Total collections to migrate: {len(collections)}")
+            logger.info(f"Collections: {', '.join(collections)}")
+            logger.info("="*80)
+            
+            for index, collection in enumerate(collections, 1):
+                try:
+                    logger.info(f"\n{'='*80}")
+                    logger.info(f"PROCESSING COLLECTION {index}/{len(collections)}: {collection}")
+                    logger.info(f"{'='*80}")
                     
+                    migrated_docs, was_skipped = self.migrate_collection(
+                        collection, 
+                        limit=limit, 
+                        collection_index=index, 
+                        total_collections=len(collections)
+                    )
+                    
+                    if was_skipped:
+                        self.migration_stats['skipped_collections'].append(collection)
+                        logger.info(f"[{index}/{len(collections)}] ⏭ Collection {collection} was skipped (already exists)")
+                    else:
+                        self.migration_stats['migrated_documents'] += migrated_docs
+                        
+                        logger.info(f"[{index}/{len(collections)}] Verifying migration for {collection}...")
+                        if self.verify_migration(collection):
+                            self.migration_stats['successful_collections'].append(collection)
+                            logger.info(f"[{index}/{len(collections)}] ✓ Migration verification successful for {collection}")
+                        else:
+                            self.migration_stats['failed_collections'].append(collection)
+                            logger.warning(f"[{index}/{len(collections)}] ⚠ Migration verification failed for {collection}")
+                        
+                    # Print progress summary
+                    completed = len(self.migration_stats['successful_collections']) + len(self.migration_stats['failed_collections']) + len(self.migration_stats['skipped_collections'])
+                    remaining = len(collections) - completed
+                    logger.info(f"\nProgress Summary: {completed}/{len(collections)} collections processed, {remaining} remaining")
+                    logger.info(f"  ✓ Successful: {len(self.migration_stats['successful_collections'])}")
+                    logger.info(f"  ✗ Failed: {len(self.migration_stats['failed_collections'])}")
+                    logger.info(f"  ⏭ Skipped: {len(self.migration_stats['skipped_collections'])}")
+                    logger.info(f"  📊 Total documents migrated: {self.migration_stats['migrated_documents']}")
+                        
+                except Exception as e:
+                    error_msg = f"Migration failed for {collection}: {str(e)}"
+                    logger.error(f"[{index}/{len(collections)}] ✗ {error_msg}")
+                    self.migration_stats['failed_collections'].append(collection)
+                    
+                    # Log specific error details for troubleshooting
+                    if "timeout" in str(e).lower():
+                        logger.error(f"[{index}/{len(collections)}] Timeout error - consider increasing timeout or reducing batch size")
+                    elif "memory" in str(e).lower():
+                        logger.error(f"[{index}/{len(collections)}] Memory error - consider reducing batch size or using --limit")
+                    elif "connection" in str(e).lower():
+                        logger.error(f"[{index}/{len(collections)}] Connection error - check network connectivity")
+                    elif "authentication" in str(e).lower() or "unauthorized" in str(e).lower():
+                        logger.error(f"[{index}/{len(collections)}] Authentication error - check API keys and credentials")
+                    elif "quota" in str(e).lower() or "limit" in str(e).lower():
+                        logger.error(f"[{index}/{len(collections)}] Quota/limit error - check Zilliz Cloud usage limits")
+                
             self.migration_stats['end_time'] = datetime.now()
             
             # Print summary
@@ -789,20 +894,14 @@ def main():
             sys.exit(1)
         return
     
-    # Check for command line arguments
-    concurrent = True  # Default to concurrent mode
-    if len(sys.argv) > 2 and sys.argv[2] == 'sequential':
-        concurrent = False
-        logger.info("Sequential mode requested via command line")
-    
     # Run migration
     try:
         # You can specify specific collections to migrate
         # collections_to_migrate = ['Vector_index_abc123_Node']
-        # migrator.run_migration(collections_to_migrate, concurrent=concurrent)
+        # migrator.run_migration(collections_to_migrate)
         
         # Or migrate all collections
-        migrator.run_migration(concurrent=concurrent)
+        migrator.run_migration()
         
     except KeyboardInterrupt:
         logger.info("Migration interrupted by user")

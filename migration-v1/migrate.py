@@ -41,10 +41,13 @@ def parse_arguments():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python migrate.py                           # Migrate all collections
+  python migrate.py                           # Migrate all collections (serial batch mode)
   python migrate.py -c Collection1 Collection2  # Migrate specific collections
   python migrate.py --dry-run                 # Preview migration without executing
+  python migrate.py --mode download           # Only download data from Weaviate
+  python migrate.py --mode download --limit 100  # Download first 100 docs per collection
   python migrate.py --log-level DEBUG        # Enable debug logging
+  python migrate.py --batch-size 500         # Use custom batch size
         """
     )
     
@@ -85,6 +88,15 @@ Examples:
         help='Limit the number of documents to migrate per collection (for testing)'
     )
     
+    parser.add_argument(
+        '--mode',
+        choices=['migrate', 'download'],
+        default='migrate',
+        help='Operation mode: migrate (full migration) or download (download data from Weaviate only)'
+    )
+    
+    # Removed concurrent options - now only supports serial batch processing
+    
     return parser.parse_args()
 
 
@@ -98,6 +110,61 @@ def validate_environment():
         logger.error(f"Configuration validation failed: {str(e)}")
         logger.error("Please check your environment variables or .env file")
         return None
+
+
+def download_data_only(migrator: WeaviateToZillizMigrator, collections: list = None, limit: int = None):
+    """Download data from Weaviate only without migration"""
+    logger.info("="*60)
+    logger.info("DOWNLOAD MODE - WEAVIATE DATA ONLY")
+    logger.info("="*60)
+    
+    try:
+        # Connect to Weaviate only
+        migrator.connect_weaviate()
+        
+        # Get collections
+        if not collections:
+            collections = migrator.get_weaviate_collections()
+            
+        logger.info(f"Collections to download: {len(collections)}")
+        
+        # Create data directory
+        os.makedirs('downloaded_data', exist_ok=True)
+        
+        for collection in collections:
+            logger.info(f"\nDownloading collection: {collection}")
+            
+            try:
+                # Get collection data using cursor pagination
+                data = migrator.get_collection_data(collection, limit=limit, show_progress=True)
+                
+                if data:
+                    # Save to JSON file
+                    filename = f"downloaded_data/{collection}_data.json"
+                    with open(filename, 'w', encoding='utf-8') as f:
+                        import json
+                        json.dump(data, f, indent=2, ensure_ascii=False, default=str)
+                    
+                    logger.info(f"  ✓ Downloaded {len(data)} documents to {filename}")
+                    
+                    # Get schema info
+                    schema = migrator.get_collection_schema(collection)
+                    if schema:
+                        schema_filename = f"downloaded_data/{collection}_schema.json"
+                        with open(schema_filename, 'w', encoding='utf-8') as f:
+                            json.dump(schema, f, indent=2, ensure_ascii=False, default=str)
+                        logger.info(f"  ✓ Downloaded schema to {schema_filename}")
+                else:
+                    logger.warning(f"  ⚠ No data found in collection {collection}")
+                    
+            except Exception as e:
+                logger.error(f"  ✗ Failed to download {collection}: {str(e)}")
+                
+        logger.info("\n" + "="*60)
+        logger.info("Download completed. Data saved to 'downloaded_data' directory.")
+        
+    except Exception as e:
+        logger.error(f"Download failed: {str(e)}")
 
 
 def preview_migration(migrator: WeaviateToZillizMigrator, collections: list = None):
@@ -188,11 +255,17 @@ def main():
         logger.info(f"Using custom batch size: {args.batch_size}")
         
     try:
+        logger.info("Using serial batch processing mode")
+        logger.info(f"Batch size: {migrator.batch_size} documents per batch")
+            
         if args.dry_run:
             # Preview mode
             preview_migration(migrator, args.collections)
+        elif args.mode == 'download':
+            # Download mode - only download data from Weaviate
+            download_data_only(migrator, args.collections, args.limit)
         else:
-            # Full migration
+            # Full migration mode - serial batch processing
             migrator.run_migration(args.collections, limit=args.limit)
             
             if not args.skip_verification:
