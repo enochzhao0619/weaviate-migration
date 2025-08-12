@@ -7,7 +7,9 @@ import sys
 import os
 import argparse
 import logging
+import json
 from pathlib import Path
+from datetime import datetime
 
 # Add src directory to path
 sys.path.insert(0, str(Path(__file__).parent / 'src'))
@@ -90,9 +92,9 @@ Examples:
     
     parser.add_argument(
         '--mode',
-        choices=['migrate', 'download'],
+        choices=['migrate', 'download', 'migrate_and_update'],
         default='migrate',
-        help='Operation mode: migrate (full migration) or download (download data from Weaviate only)'
+        help='Operation mode: migrate (full migration), download (download data from Weaviate only), or migrate_and_update (migrate then update DB)'
     )
     
     # Removed concurrent options - now only supports serial batch processing
@@ -264,6 +266,63 @@ def main():
         elif args.mode == 'download':
             # Download mode - only download data from Weaviate
             download_data_only(migrator, args.collections, args.limit)
+        elif args.mode == 'migrate_and_update':
+            # Full migration then update DB, then output compact summary
+            migrator.run_migration(args.collections, limit=args.limit)
+
+            # After migration, perform DB update over all Weaviate classes
+            try:
+                migrator.connect_postgresql()
+                # Weaviate client already connected during run_migration
+                db_stats = migrator.update_pg_datasets_vector_store_type()
+            except Exception as e:
+                logger.error(f"Post-migration DB update failed: {str(e)}")
+                db_stats = {
+                    'updated_details': [],
+                    'failed_details': [{'dataset_id': None, 'class_name': None, 'error': str(e)}],
+                    'not_found_details': []
+                }
+
+            # Build concise summary
+            try:
+                collections = migrator.report_generator.migration_data.get('collections', {})
+                migrated = []
+                failed = []
+                for c in collections.values():
+                    if c.get('status') == 'success':
+                        migrated.append({
+                            'class': c.get('name'),
+                            'documents': int(c.get('migrated_documents', 0))
+                        })
+                    elif c.get('status') == 'failed':
+                        failed.append({
+                            'class': c.get('name'),
+                            'reason': c.get('error_message') or 'Unknown error'
+                        })
+
+                compact_summary = {
+                    'migrated_classes': migrated,
+                    'failed_migrations': failed,
+                    'db_update': {
+                        'updated': db_stats.get('updated_details', []),
+                        'failed': db_stats.get('failed_details', []),
+                        'not_found': db_stats.get('not_found_details', [])
+                    }
+                }
+
+                os.makedirs('reports', exist_ok=True)
+                summary_path = f"reports/compact_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+                with open(summary_path, 'w', encoding='utf-8') as f:
+                    json.dump(compact_summary, f, indent=2, ensure_ascii=False)
+                logger.info(f"Compact migration summary saved to: {summary_path}")
+            except Exception as e:
+                logger.error(f"Failed to build/save compact summary: {str(e)}")
+
+            if not args.skip_verification:
+                logger.info("Migration (with DB update) completed successfully!")
+            else:
+                logger.info("Migration (with DB update) completed (verification skipped)")
+
         else:
             # Full migration mode - serial batch processing
             migrator.run_migration(args.collections, limit=args.limit)

@@ -202,7 +202,11 @@ class WeaviateToZillizMigrator:
             'class_prefix_matches': 0,
             'class_prefix_mismatches': 0,
             'errors': [],
-            'mismatch_details': []
+            'mismatch_details': [],
+            # Newly added detailed result lists for concise summary building
+            'updated_details': [],  # List[{'dataset_id': str, 'class_name': str}]
+            'failed_details': [],   # List[{'dataset_id': str, 'class_name': str, 'error': str}]
+            'not_found_details': [] # List[{'dataset_id': str, 'class_name': str}]
         }
         
         try:
@@ -232,6 +236,7 @@ class WeaviateToZillizMigrator:
                         if not dataset:
                             stats['not_found_datasets'] += 1
                             logger.warning(f"Dataset not found for ID: {dataset_id}")
+                            stats['not_found_details'].append({'dataset_id': dataset_id, 'class_name': class_name})
                             continue
                         
                         # Step 4: Parse and update index_struct
@@ -283,6 +288,7 @@ class WeaviateToZillizMigrator:
                             
                             stats['updated_datasets'] += 1
                             logger.info(f"✓ Updated dataset {dataset_id}: weaviate -> milvus")
+                            stats['updated_details'].append({'dataset_id': dataset_id, 'class_name': class_name})
                             
                         else:
                             logger.info(f"Dataset {dataset_id} does not have weaviate vector store config, skipping")
@@ -292,6 +298,11 @@ class WeaviateToZillizMigrator:
                         error_msg = f"Failed to update dataset for class {class_name}: {str(e)}"
                         stats['errors'].append(error_msg)
                         logger.error(error_msg)
+                        try:
+                            # dataset_id may be available from earlier transformation
+                            stats['failed_details'].append({'dataset_id': dataset_id, 'class_name': class_name, 'error': str(e)})
+                        except Exception:
+                            stats['failed_details'].append({'dataset_id': None, 'class_name': class_name, 'error': str(e)})
                         continue
             
             # Step 7: Log summary
@@ -333,6 +344,8 @@ class WeaviateToZillizMigrator:
     def get_weaviate_collections(self) -> List[str]:
         """Get all collection names from Weaviate using v3 client"""
         try:
+            # add debug log
+            logger.info(f"Start to retrieval data")
             schema = self.weaviate_client.schema.get()
             collections = [cls['class'] for cls in schema.get('classes', [])]
             logger.info(f"Found {len(collections)} collections in Weaviate: {collections}")
