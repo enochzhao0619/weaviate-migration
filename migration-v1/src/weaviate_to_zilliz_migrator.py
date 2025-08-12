@@ -58,7 +58,7 @@ class WeaviateToZillizMigrator:
         self.pg_host = os.getenv('PG_HOST', 'localhost')
         self.pg_port = int(os.getenv('PG_PORT', '5432'))
         self.pg_database = os.getenv('PG_DATABASE', 'dify')
-        self.pg_username = os.getenv('PG_USERNAME', 'postgres')
+        self.pg_username = os.getenv('PG_USER', 'postgres')
         self.pg_password = os.getenv('PG_PASSWORD', '')
         
         # Migration configuration
@@ -179,6 +179,7 @@ class WeaviateToZillizMigrator:
         
     def update_pg_datasets_vector_store_type(self) -> Dict[str, Any]:
         """Update PostgreSQL datasets table to change vector store type from weaviate to milvus
+        and validate class_prefix consistency
         
         Returns:
             Dict containing update statistics and results
@@ -198,7 +199,10 @@ class WeaviateToZillizMigrator:
             'updated_datasets': 0,
             'failed_updates': 0,
             'not_found_datasets': 0,
-            'errors': []
+            'class_prefix_matches': 0,
+            'class_prefix_mismatches': 0,
+            'errors': [],
+            'mismatch_details': []
         }
         
         try:
@@ -220,7 +224,7 @@ class WeaviateToZillizMigrator:
                         
                         # Step 3: Query dataset by ID
                         cursor.execute(
-                            "SELECT id, retrieval_model FROM datasets WHERE id = %s",
+                            "SELECT id, index_struct FROM datasets WHERE id = %s",
                             (dataset_id,)
                         )
                         dataset = cursor.fetchone()
@@ -230,24 +234,51 @@ class WeaviateToZillizMigrator:
                             logger.warning(f"Dataset not found for ID: {dataset_id}")
                             continue
                         
-                        # Step 4: Parse and update retrieval_model
-                        retrieval_model = dataset['retrieval_model']
-                        if not retrieval_model:
-                            logger.warning(f"No retrieval_model found for dataset: {dataset_id}")
+                        # Step 4: Parse and update index_struct
+                        index_struct_raw = dataset['index_struct']
+                        if not index_struct_raw:
+                            logger.warning(f"No index_struct found for dataset: {dataset_id}")
                             continue
                         
-                        # Check if it's weaviate type and has vector_store config
-                        if (isinstance(retrieval_model, dict) and 
-                            retrieval_model.get('type') == 'weaviate' and 
-                            'vector_store' in retrieval_model):
+                        # Parse JSON string to dict if it's a string
+                        try:
+                            if isinstance(index_struct_raw, str):
+                                index_struct = json.loads(index_struct_raw)
+                            else:
+                                index_struct = index_struct_raw
+                        except (json.JSONDecodeError, TypeError) as e:
+                            logger.error(f"Failed to parse index_struct for dataset {dataset_id}: {e}")
+                            continue
                             
-                            # Update the type from weaviate to milvus
-                            retrieval_model['type'] = 'milvus'
+                        # Check if it's weaviate type and has vector_store config
+                        if (isinstance(index_struct, dict) and 
+                            index_struct.get('type') == 'weaviate' and 
+                            'vector_store' in index_struct):
+                            
+                            # Step 5: Validate class_prefix consistency
+                            vector_store = index_struct['vector_store']
+                            class_prefix = vector_store.get('class_prefix', '')
+                            
+                            if class_prefix == class_name:
+                                stats['class_prefix_matches'] += 1
+                                logger.info(f"✓ Class prefix matches: {class_prefix}")
+                            else:
+                                stats['class_prefix_mismatches'] += 1
+                                mismatch_info = {
+                                    'dataset_id': dataset_id,
+                                    'class_name': class_name,
+                                    'class_prefix': class_prefix
+                                }
+                                stats['mismatch_details'].append(mismatch_info)
+                                logger.warning(f"⚠ Class prefix mismatch - Expected: {class_name}, Found: {class_prefix}")
+                            
+                            # Step 6: Update the type from weaviate to milvus
+                            index_struct['type'] = 'milvus'
                             
                             # Update the database
                             cursor.execute(
-                                "UPDATE datasets SET retrieval_model = %s WHERE id = %s",
-                                (json.dumps(retrieval_model), dataset_id)
+                                "UPDATE datasets SET index_struct = %s WHERE id = %s",
+                                (json.dumps(index_struct), dataset_id)
                             )
                             
                             stats['updated_datasets'] += 1
@@ -263,7 +294,7 @@ class WeaviateToZillizMigrator:
                         logger.error(error_msg)
                         continue
             
-            # Step 5: Log summary
+            # Step 7: Log summary
             logger.info("\n" + "="*60)
             logger.info("POSTGRESQL DATASETS UPDATE SUMMARY")
             logger.info("="*60)
@@ -272,9 +303,20 @@ class WeaviateToZillizMigrator:
             logger.info(f"Successfully updated: {stats['updated_datasets']}")
             logger.info(f"Not found datasets: {stats['not_found_datasets']}")
             logger.info(f"Failed updates: {stats['failed_updates']}")
+            logger.info(f"Class prefix matches: {stats['class_prefix_matches']}")
+            logger.info(f"Class prefix mismatches: {stats['class_prefix_mismatches']}")
+            
+            if stats['mismatch_details']:
+                logger.warning(f"\nClass prefix mismatch details:")
+                for mismatch in stats['mismatch_details'][:10]:  # Show first 10 mismatches
+                    logger.warning(f"  Dataset: {mismatch['dataset_id']}")
+                    logger.warning(f"    Expected: {mismatch['class_name']}")
+                    logger.warning(f"    Found: {mismatch['class_prefix']}")
+                if len(stats['mismatch_details']) > 10:
+                    logger.warning(f"  ... and {len(stats['mismatch_details']) - 10} more mismatches")
             
             if stats['errors']:
-                logger.warning(f"Errors encountered:")
+                logger.warning(f"\nErrors encountered:")
                 for error in stats['errors'][:5]:  # Show first 5 errors
                     logger.warning(f"  {error}")
                 if len(stats['errors']) > 5:

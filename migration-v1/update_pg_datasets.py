@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 
 from weaviate_to_zilliz_migrator import WeaviateToZillizMigrator
+from update_report_generator import UpdateReportGenerator
 
 # Load environment variables
 load_dotenv()
@@ -36,7 +37,7 @@ def main():
     logger.info("Starting PostgreSQL datasets vector store type update")
     
     # Validate required environment variables
-    required_pg_vars = ['PG_HOST', 'PG_DATABASE', 'PG_USERNAME', 'PG_PASSWORD']
+    required_pg_vars = ['PG_HOST', 'PG_DATABASE', 'PG_USER', 'PG_PASSWORD']
     required_weaviate_vars = ['WEAVIATE_ENDPOINT']
     
     missing_vars = []
@@ -51,13 +52,23 @@ def main():
     if missing_vars:
         logger.error(f"Missing required environment variables: {', '.join(missing_vars)}")
         logger.error("Please set these variables in your .env file or environment")
-        logger.error("Required PostgreSQL variables: PG_HOST, PG_DATABASE, PG_USERNAME, PG_PASSWORD")
+        logger.error("Required PostgreSQL variables: PG_HOST, PG_DATABASE, PG_USER, PG_PASSWORD")
         logger.error("Required Weaviate variables: WEAVIATE_ENDPOINT")
         sys.exit(1)
     
     try:
-        # Create migrator instance
+        # Create migrator instance and report generator
         migrator = WeaviateToZillizMigrator()
+        report_generator = UpdateReportGenerator(reports_dir="../reports")
+        
+        # Set update start time and configuration
+        start_time = datetime.now()
+        config = {
+            'weaviate_endpoint': os.getenv('WEAVIATE_ENDPOINT'),
+            'postgresql_host': os.getenv('PG_HOST', 'localhost'),
+            'postgresql_database': os.getenv('PG_DATABASE', 'dify')
+        }
+        report_generator.set_update_start(start_time, config)
         
         # Connect to both systems
         logger.info("Connecting to Weaviate...")
@@ -69,6 +80,15 @@ def main():
         # Update PostgreSQL datasets
         logger.info("Starting PostgreSQL datasets update process...")
         stats = migrator.update_pg_datasets_vector_store_type()
+        
+        # Set update end time and statistics
+        end_time = datetime.now()
+        report_generator.set_update_end(end_time)
+        report_generator.set_update_statistics(stats)
+        
+        # Generate reports
+        logger.info("Generating update reports...")
+        reports = report_generator.generate_all_reports()
         
         # Print final summary
         logger.info("\n" + "="*60)
@@ -86,6 +106,15 @@ def main():
         
         if stats['failed_updates'] > 0:
             logger.warning(f"⚠ {stats['failed_updates']} updates failed - check logs for details")
+        
+        # Print report file locations
+        if reports:
+            logger.info("\n" + "="*60)
+            logger.info("UPDATE REPORTS GENERATED")
+            logger.info("="*60)
+            for report_type, filepath in reports.items():
+                logger.info(f"{report_type.upper()} Report: {filepath}")
+            logger.info("="*60)
         
     except KeyboardInterrupt:
         logger.info("Update process interrupted by user")
